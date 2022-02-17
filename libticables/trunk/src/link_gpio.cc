@@ -33,7 +33,9 @@
 
 #include <stdio.h>
 #include <stdint.h>
-#include <gpiod.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 
 #include "ticables.h"
 #include "error.h"
@@ -56,40 +58,40 @@ enum {
  * gpiod_line instances for setting either, as a line can only be in use
  * once. So for the time being, just use a gpiod_line for each. */
 struct GPIOPriv {
-	struct gpiod_chip *chip;
-	struct gpiod_line *line_red, *line_white;
+	int line_red, line_white;
 };
 
+static volatile uint32_t *gpio_base = (volatile uint32_t*) MAP_FAILED;
 static int cable_gpio_close(CableHandle *h);
 
 static int cable_gpio_open(CableHandle *h)
 {
+	if(gpio_base != MAP_FAILED) {
+		ticables_warning(_("Can only have one instance of this cable."));
+		return ERR_BUSY;
+	}
+
 	GPIOPriv *priv = (GPIOPriv*) calloc(1, sizeof(GPIOPriv));
 	h->priv = priv;
+	int mem_fd;
 
 	if (!priv) {
 		ticables_warning(_("Memory allocation failed."));
 		goto err_cleanup;
 	}
 
-	priv->chip = gpiod_chip_open("/dev/gpiochip0");
-	if (!priv->chip) {
-		ticables_warning(_("Failed to open /dev/gpiochip0."));
+	priv->line_red = 23;
+	priv->line_white = 24;
+
+	mem_fd = open("/dev/mem", O_RDWR);
+	if(mem_fd < 0) {
 		goto err_cleanup;
 	}
 
-	if (strcmp(gpiod_chip_label(priv->chip), "pinctrl-bcm2835") != 0) {
-		ticables_warning(_("/dev/gpiochip0 isn't the expected device."));
-		goto err_cleanup;
-	}
+	gpio_base = (volatile uint32_t*)mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, 0x3F000000 + 0x200000);
+	close(mem_fd);
 
-	priv->line_red = gpiod_chip_get_line(priv->chip, 23),
-	priv->line_white = gpiod_chip_get_line(priv->chip, 24);
-
-	if(!priv->line_red || !priv->line_white
-		|| gpiod_line_request_input(priv->line_red, "libticables") != 0
-		|| gpiod_line_request_input(priv->line_white, "libticables") != 0) {
-		ticables_warning(_("Failed to request GPIO lines."));
+	if (gpio_base == MAP_FAILED) {
 		goto err_cleanup;
 	}
 
@@ -106,32 +108,24 @@ static int cable_gpio_close(CableHandle *h)
 	if (!priv)
 		return 0;
 
-	// It does not hurt to release a line which wasn't requested
-	if (priv->line_red)
-		gpiod_line_release(priv->line_red);
-
-	if (priv->line_white)
-		gpiod_line_release(priv->line_white);
-
-	if (priv->chip)
-		gpiod_chip_close(priv->chip);
+	if (gpio_base != MAP_FAILED) {
+		munmap((void*) gpio_base, 4096);
+		gpio_base = (volatile uint32_t*) MAP_FAILED;
+	}
 
 	free(h->priv);
 	h->priv = NULL;
 	return 0;
 }
 
-/* Unfortunately gpiod_line_set_config internally does GPIO_GET_LINEINFO_IOCTL
- * after changing the config, which halves the speed of this function. */
-static int set_line(struct gpiod_line *line, bool b)
+static int set_line(int line, bool b)
 {
-	int ret;
-	if(b)
-		ret = gpiod_line_set_config(line, GPIOD_LINE_REQUEST_DIRECTION_INPUT, 0, 0);
-	else
-		ret = gpiod_line_set_config(line, GPIOD_LINE_REQUEST_DIRECTION_OUTPUT, 0, 0);
+	if(b) // Set as input
+		gpio_base[2] &= ~(0b111 << ((line - 20)*3));
+	else // Set as output
+		gpio_base[2] |= 1 << ((line - 20)*3);
 
-	return ret == 0;
+	return 0;
 }
 
 static int cable_gpio_set_red_wire(CableHandle *h, int b)
@@ -160,14 +154,7 @@ static int cable_gpio_set_raw(CableHandle *h, int state)
  * The mask is used to avoid unnecessary ioctl calls. */
 static int cable_gpio_get_raw_masked(CableHandle *h, int *state, int mask)
 {
-	GPIOPriv *priv = (GPIOPriv*) h->priv;
-
-	*state = 0;
-	if ((mask & BIT_WHITE) && gpiod_line_get_value(priv->line_white) == 1)
-		*state |= BIT_WHITE;
-	if ((mask & BIT_RED) && gpiod_line_get_value(priv->line_red) == 1)
-		*state |= BIT_RED;
-
+	*state = (gpio_base[13] >> 23) & mask;
 	return 0;
 }
 
@@ -195,6 +182,7 @@ static int wait_for_line_state(CableHandle *h, int mask, int want)
 {
 	tiTIME clk;
 	bool to_started = false;
+	int attempts = 0;
 
 	while (true) {
 		int state;
@@ -207,7 +195,9 @@ static int wait_for_line_state(CableHandle *h, int mask, int want)
 
 		// Syscalls are expensive, so avoid unnecessary calls to
 		// TO_START/TO_ELAPSED.
-		if (!to_started) {
+		if(!to_started && attempts < 1000)
+			attempts++;
+		else if (!to_started) {
 			TO_START(clk);
 			to_started = true;
 		} else if (TO_ELAPSED(clk, h->timeout))
@@ -273,6 +263,7 @@ static int cable_gpio_get(CableHandle *h, uint8_t *data, uint32_t len)
 		for (int bit = 0; bit < 8; bit++)  {
 			tiTIME clk;
 			bool to_started = false;
+			int attempts = 0;
 			int state;
 			int ret;
 
@@ -285,7 +276,9 @@ static int cable_gpio_get(CableHandle *h, uint8_t *data, uint32_t len)
 				if (state != 0b11)
 					break;
 
-				if (!to_started) {
+				if(!to_started && attempts < 10000)
+					attempts++;
+				else if(!to_started) {
 					TO_START(clk);
 					to_started = true;
 				} else if (TO_ELAPSED(clk, h->timeout))
@@ -310,9 +303,12 @@ static int cable_gpio_get(CableHandle *h, uint8_t *data, uint32_t len)
 				cable_gpio_set_white_wire(h, 1);
 			}
 
-			/* There should be a delay according to h->delay here,
-			 * but gpiod calls are slow enough already that it works reliably,
-			 * and adding explicit waiting would only slow it down further. */
+			/* It's impossible to tell apart whether the line is still
+			 * held low by us or whether the next bit was sent. Wait
+			 * a bit to be sure. */
+			int dummy;
+			for(int i = 0; i < h->delay; ++i)
+				cable_gpio_get_raw(h, &dummy);
 		}
 
 		data[off] = byte;
